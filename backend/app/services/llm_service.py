@@ -6,10 +6,13 @@ import logging
 from typing import AsyncGenerator, List, Dict, Any
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+from langchain.agents import create_agent
 
 from app.config import Settings
+from app.utils.tools import get_weather
 
 logger = logging.getLogger(__name__)
+
 
 
 class LLMService:
@@ -33,7 +36,7 @@ class LLMService:
             BaseChatModel 实例（LangChain 统一接口）
         """
         provider = self.settings.LLM_PROVIDER.lower()
-        
+
         # 根据配置动态选择 LLM 提供商
         if provider == "zhipuai":
             return self._create_zhipuai_llm(model_name, temperature, max_tokens, streaming)
@@ -43,15 +46,15 @@ class LLMService:
             return self._create_anthropic_llm(model_name, temperature, max_tokens, streaming)
         else:
             raise ValueError(f"不支持的 LLM 提供商: {provider}")
-    
+
     def _create_zhipuai_llm(self, model_name: str, temperature: float,
-                           max_tokens: int, streaming: bool) -> BaseChatModel:
+                            max_tokens: int, streaming: bool) -> BaseChatModel:
         """创建智谱AI LLM 实例"""
         from langchain_community.chat_models import ChatZhipuAI
-        
+
         if not self.settings.ZHIPUAI_API_KEY:
             raise ValueError("ZHIPUAI_API_KEY 未配置")
-        
+
         return ChatZhipuAI(
             api_key=self.settings.ZHIPUAI_API_KEY,
             model=model_name or self.settings.MODEL_NAME,
@@ -59,18 +62,19 @@ class LLMService:
             max_tokens=max_tokens or self.settings.MAX_TOKENS,
             streaming=streaming,
         )
-    
+
     def _create_openai_llm(self, model_name: str, temperature: float,
-                          max_tokens: int, streaming: bool) -> BaseChatModel:
+                           max_tokens: int, streaming: bool) -> BaseChatModel:
         """创建 OpenAI LLM 实例"""
         try:
             from langchain_openai import ChatOpenAI
         except ImportError:
-            raise ImportError("请安装 langchain-openai: pip install langchain-openai")
-        
+            raise ImportError(
+                "请安装 langchain-openai: pip install langchain-openai")
+
         if not self.settings.OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY 未配置")
-        
+
         return ChatOpenAI(
             api_key=self.settings.OPENAI_API_KEY,
             base_url=self.settings.OPENAI_API_BASE,
@@ -79,18 +83,19 @@ class LLMService:
             max_tokens=max_tokens or self.settings.MAX_TOKENS,
             streaming=streaming,
         )
-    
+
     def _create_anthropic_llm(self, model_name: str, temperature: float,
-                             max_tokens: int, streaming: bool) -> BaseChatModel:
+                              max_tokens: int, streaming: bool) -> BaseChatModel:
         """创建 Anthropic LLM 实例"""
         try:
             from langchain_anthropic import ChatAnthropic
         except ImportError:
-            raise ImportError("请安装 langchain-anthropic: pip install langchain-anthropic")
-        
+            raise ImportError(
+                "请安装 langchain-anthropic: pip install langchain-anthropic")
+
         if not self.settings.ANTHROPIC_API_KEY:
             raise ValueError("ANTHROPIC_API_KEY 未配置")
-        
+
         return ChatAnthropic(
             api_key=self.settings.ANTHROPIC_API_KEY,
             model=model_name or "claude-3-sonnet-20240229",
@@ -212,8 +217,58 @@ class LLMService:
 
             yield ""
 
-            logger.debug(f"LLM stream completed, total content: {repr(content)}")
+            logger.debug(
+                f"LLM stream completed, total content: {repr(content)}")
 
+        except Exception as e:
+            logger.error(f"流式 LLM 调用失败: {str(e)}", exc_info=True)
+            import json
+            error_data = json.dumps({"error": str(e)})
+            yield f"data: {error_data}\n\n"
+            yield "data: [DONE]\n\n"
+
+    async def agent_stream(self, messages: List[Dict[str, str]],
+                           temperature: float = None,
+                           max_tokens: int = None,
+                           model_name: str = None) -> AsyncGenerator[str, None]:
+        """
+        流式聊天 - 生成器模式
+
+        Args:
+            messages: 消息历史
+            temperature: 温度参数
+            max_tokens: 最大token数
+            model_name: 模型名称
+
+        Yields:
+            SSE 格式的 token 数据
+        """
+        try:
+            langchain_messages = self._convert_messages(messages)
+
+            llm = self._create_llm(
+                model_name=model_name,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                streaming=True
+            )
+
+            # 创建带有工具的 Agent
+            agent = create_agent(
+                model=llm,
+                tools=[get_weather]
+            )
+
+            # 使用 astream 方法进行流式调用
+            async for chunk in agent.astream({
+                "messages": langchain_messages
+            }, stream_mode="values"):
+                logger.debug(f"Agent chunk: {chunk}")
+                # 每个块包含该时间点的完整状态
+                latest_message = chunk["messages"][-1]
+                if hasattr(latest_message, 'content') and latest_message.content and isinstance(latest_message, AIMessage):
+                    yield f"{latest_message.content}"
+                    
         except Exception as e:
             logger.error(f"流式 LLM 调用失败: {str(e)}", exc_info=True)
             import json
